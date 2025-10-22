@@ -84,7 +84,7 @@ else
 fi
 
 # Check backend
-if curl -f http://localhost:8000/health > /dev/null 2>&1; then
+if curl -f http://localhost:4001/health > /dev/null 2>&1; then
     print_success "Backend API is ready"
 else
     print_error "Backend API is not ready"
@@ -120,11 +120,11 @@ print('Initial data seeded successfully')
 
 print_success "🎉 Translation Management System deployed successfully!"
 print_status "Services are running:"
-print_status "  - Frontend: http://localhost:3000"
-print_status "  - Backend API: http://localhost:8000"
-print_status "  - API Documentation: http://localhost:8000/docs"
-print_status "  - Database: localhost:5432"
-print_status "  - Redis: localhost:6379"
+print_status "  - Frontend (served by Nginx): http://localhost:4000"
+print_status "  - Backend API: http://localhost:4001"
+print_status "  - API Documentation: http://localhost:4001/docs"
+print_status "  - Database: localhost:5433"
+print_status "  - Redis: localhost:6380"
 
 print_status "To view logs: docker-compose logs -f"
 print_status "To stop services: docker-compose down"

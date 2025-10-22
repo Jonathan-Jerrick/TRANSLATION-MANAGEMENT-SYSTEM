@@ -46,6 +46,10 @@ class State:
         self._lock = Lock()
         self._seeded = False
 
+    @property
+    def seeded(self) -> bool:
+        return self._seeded
+
     # Connector operations -------------------------------------------------
     def add_connector(self, connector: Connector) -> Connector:
         with self._lock:
@@ -263,10 +267,6 @@ class State:
         )
 
     # Seed helpers ---------------------------------------------------------
-    @property
-    def seeded(self) -> bool:
-        return self._seeded
-
     def mark_seeded(self) -> None:
         self._seeded = True
 

@@ -16,6 +16,9 @@ from .models import (
 from .services import ProjectService, TermBaseService, TranslationMemoryService
 from .state import State
 from .workflows import workflow_status
+from sqlalchemy import text
+from .database import SessionLocal
+from .db_models import Connector as ORMConnector, Vendor as ORMVendor, ConnectorType as ORMConnectorType
 
 
 def seed_initial_data(
@@ -31,215 +34,276 @@ def seed_initial_data(
 
     now = datetime.utcnow()
 
-    connectors = [
-        Connector(
-            id="manual-intake",
-            name="Manual Intake",
-            type=ConnectorType.CMS,
-            sector="ecommerce",
-            created_at=now,
-            metadata={"mode": "manual"},
-            auto_sync=False,
-        ),
-        Connector(
-            id=str(uuid4()),
-            name="Shopify Connector",
-            type=ConnectorType.CMS,
-            sector="ecommerce",
-            created_at=now,
-            metadata={"platform": "shopify"},
-            content_paths=["/products", "/collections"],
-        ),
-        Connector(
-            id=str(uuid4()),
-            name="Banking Git Sync",
-            type=ConnectorType.GIT,
-            sector="bfsi",
-            created_at=now,
-            metadata={"repository": "git@corp/bfsi-portal"},
-            content_paths=["/src/locales"],
-        ),
-        Connector(
-            id=str(uuid4()),
-            name="Legal CMS Connector",
-            type=ConnectorType.CMS,
-            sector="legal",
-            created_at=now,
-            metadata={"platform": "drupal"},
-            content_paths=["/cases", "/knowledge"],
-        ),
-    ]
-    for connector in connectors:
-        state.add_connector(connector)
+    if not state.list_connectors():
+        seed_connectors = [
+            Connector(
+                id="00000000-0000-0000-0000-000000000001",
+                name="Manual Intake",
+                type=ConnectorType.CMS,
+                sector="ecommerce",
+                created_at=now,
+                metadata={"mode": "manual"},
+                auto_sync=False,
+            ),
+            Connector(
+                id="00000000-0000-0000-0000-000000000002",
+                name="Shopify Connector",
+                type=ConnectorType.CMS,
+                sector="ecommerce",
+                created_at=now,
+                metadata={"platform": "shopify"},
+                content_paths=["/products", "/collections"],
+            ),
+            Connector(
+                id="00000000-0000-0000-0000-000000000003",
+                name="Banking Git Sync",
+                type=ConnectorType.GIT,
+                sector="bfsi",
+                created_at=now,
+                metadata={"repository": "git@corp/bfsi-portal"},
+                content_paths=["/src/locales"],
+            ),
+            Connector(
+                id="00000000-0000-0000-0000-000000000004",
+                name="Legal CMS Connector",
+                type=ConnectorType.CMS,
+                sector="legal",
+                created_at=now,
+                metadata={"platform": "drupal"},
+                content_paths=["/cases", "/knowledge"],
+            ),
+        ]
+        session = SessionLocal()
+        try:
+            for connector in seed_connectors:
+                state.add_connector(connector)
+                session.merge(
+                    ORMConnector(
+                        id=connector.id,
+                        name=connector.name,
+                        type=ORMConnectorType[connector.type.name],
+                        sector=connector.sector,
+                        config_data=connector.metadata,
+                        auto_sync=connector.auto_sync,
+                        content_paths=connector.content_paths,
+                        last_synced_at=connector.last_synced_at,
+                        last_sync_status=connector.last_sync_status,
+                        active=True,
+                        created_at=connector.created_at,
+                    )
+                )
+            session.execute(text("UPDATE connectors SET type = upper(type::text)::connectortype"))
+            session.commit()
+        finally:
+            session.close()
 
-    vendors = [
-        Vendor(
-            id=str(uuid4()),
-            name="Global LSP Alliance",
-            sectors=["ecommerce", "bfsi"],
-            locales=["en-US", "es-ES", "fr-FR"],
-            rating=4.9,
-            contact_email="projects@globallsp.com",
-        ),
-        Vendor(
-            id=str(uuid4()),
-            name="LexiLegal Partners",
-            sectors=["legal"],
-            locales=["en-US", "es-ES", "fr-FR"],
-            rating=4.7,
-            contact_email="ops@lexilegal.example",
-        ),
-    ]
-    for vendor in vendors:
-        state.add_vendor(vendor)
+    if not state.list_vendors():
+        seed_vendors = [
+            Vendor(
+                id="00000000-0000-0000-0000-000000000101",
+                name="Global LSP Alliance",
+                sectors=["ecommerce", "bfsi"],
+                locales=["en-US", "es-ES", "fr-FR"],
+                rating=4.9,
+                contact_email="projects@globallsp.com",
+            ),
+            Vendor(
+                id="00000000-0000-0000-0000-000000000102",
+                name="LexiLegal Partners",
+                sectors=["legal"],
+                locales=["en-US", "es-ES", "fr-FR"],
+                rating=4.7,
+                contact_email="ops@lexilegal.example",
+            ),
+        ]
+        session = SessionLocal()
+        try:
+            for vendor in seed_vendors:
+                state.add_vendor(vendor)
+                session.merge(
+                    ORMVendor(
+                        id=vendor.id,
+                        name=vendor.name,
+                        sectors=vendor.sectors,
+                        locales=vendor.locales,
+                        rating=vendor.rating,
+                        contact_email=vendor.contact_email,
+                        active=vendor.active,
+                        created_at=vendor.created_at,
+                    )
+                )
+            session.commit()
+        finally:
+            session.close()
+
+    connectors = state.list_connectors()
+    vendors = state.list_vendors()
 
     # Seed translation memory with sample strings used across the demo content
-    tm_service.add_entry("en-US", "es-ES", "Welcome to our store!", "¡Bienvenido a nuestra tienda!")
-    tm_service.add_entry("en-US", "fr-FR", "Welcome to our store!", "Bienvenue dans notre boutique !")
-    tm_service.add_entry("en-US", "de-DE", "Secure payment portal", "Sicheres Zahlungsportal")
-    tm_service.add_entry("en-US", "es-ES", "Account statement", "Estado de cuenta")
-    tm_service.add_entry("en-US", "fr-FR", "Compliance update", "Mise à jour de conformité")
+    if not tm_service.list_entries("en-US", "es-ES"):
+        tm_service.add_entry("en-US", "es-ES", "Welcome to our store!", "¡Bienvenido a nuestra tienda!")
+        tm_service.add_entry("en-US", "fr-FR", "Welcome to our store!", "Bienvenue dans notre boutique !")
+        tm_service.add_entry("en-US", "de-DE", "Secure payment portal", "Sicheres Zahlungsportal")
+        tm_service.add_entry("en-US", "es-ES", "Account statement", "Estado de cuenta")
+        tm_service.add_entry("en-US", "fr-FR", "Compliance update", "Mise à jour de conformité")
 
     # Term base entries per sector
-    term_service.add_entry("bfsi", "en-US", "es-ES", "routing number", "número de ruta", "Banking terminology")
-    term_service.add_entry("bfsi", "en-US", "fr-FR", "routing number", "numéro d'acheminement")
-    term_service.add_entry("legal", "en-US", "es-ES", "indemnification", "indemnización", "Contractual clause")
-    term_service.add_entry("legal", "en-US", "fr-FR", "indemnification", "indemnisation")
-    term_service.add_entry("ecommerce", "en-US", "es-ES", "shopping cart", "carrito de compras")
+    if not term_service.list_entries("bfsi", "en-US", "es-ES"):
+        term_service.add_entry("bfsi", "en-US", "es-ES", "routing number", "número de ruta", "Banking terminology")
+        term_service.add_entry("bfsi", "en-US", "fr-FR", "routing number", "numéro d'acheminement")
+        term_service.add_entry("legal", "en-US", "es-ES", "indemnification", "indemnización", "Contractual clause")
+        term_service.add_entry("legal", "en-US", "fr-FR", "indemnification", "indemnisation")
+        term_service.add_entry("ecommerce", "en-US", "es-ES", "shopping cart", "carrito de compras")
 
-    project_payloads = [
-        ProjectCreate(
-            name="Tech Manual EN-ES",
-            sector="ecommerce",
-            source_locale="en-US",
-            target_locales=["es-ES"],
-            content=(
-                "Welcome to our store!\n"
-                "Ensure all firmware is updated before installation.\n"
-                "Contact support for warranty claims."
+    created_jobs = []
+    if not state.list_jobs():
+        project_payloads = [
+            ProjectCreate(
+                name="Tech Manual EN-ES",
+                sector="ecommerce",
+                source_locale="en-US",
+                target_locales=["es-ES"],
+                content=(
+                    "Welcome to our store!\n"
+                    "Ensure all firmware is updated before installation.\n"
+                    "Contact support for warranty claims."
+                ),
+                client="TechCorp Inc",
+                priority=ProjectPriority.HIGH,
+                due_date=now + timedelta(days=2),
+                estimated_word_count=1800,
+                budget=2450.0,
+                description="Localization of installation manual for consumer hardware.",
+                assigned_vendor_id=vendors[0].id if vendors else None,
+                connector_id=connectors[1].id if len(connectors) > 1 else None,
+                metadata={
+                    "reporting_week": "Week 1",
+                    "translator": "carlos.vega",
+                    "translation_hours": "18",
+                    "rating": "4.9",
+                    "workflow_mode": "human_post_edit",
+                    "manager_name": "Samantha Carter",
+                    "manager_email": "samantha.carter@techcorp.example",
+                },
             ),
-            client="TechCorp Inc",
-            priority=ProjectPriority.HIGH,
-            due_date=now + timedelta(days=2),
-            estimated_word_count=1800,
-            budget=2450.0,
-            description="Localization of installation manual for consumer hardware.",
-            assigned_vendor_id=vendors[0].id,
-            connector_id=connectors[1].id,
-            metadata={
-                "reporting_week": "Week 1",
-                "translator": "carlos.vega",
-                "translation_hours": "18",
-                "rating": "4.9",
-            },
-        ),
-        ProjectCreate(
-            name="Legal Document FR-EN",
-            sector="legal",
-            source_locale="fr-FR",
-            target_locales=["en-US"],
-            content=(
-                "Cette clause couvre l'indemnisation des partenaires.\n"
-                "La mise à jour de conformité doit être signée avant le 30 juin."
+            ProjectCreate(
+                name="Legal Document FR-EN",
+                sector="legal",
+                source_locale="fr-FR",
+                target_locales=["en-US"],
+                content=(
+                    "Cette clause couvre l'indemnisation des partenaires.\n"
+                    "La mise à jour de conformité doit être signée avant le 30 juin."
+                ),
+                client="Legal Services Co",
+                priority=ProjectPriority.CRITICAL,
+                due_date=now + timedelta(days=1),
+                estimated_word_count=2300,
+                budget=3200.0,
+                description="Contract localization for cross-border compliance.",
+                assigned_vendor_id=vendors[1].id if len(vendors) > 1 else None,
+                connector_id=connectors[3].id if len(connectors) > 3 else None,
+                metadata={
+                    "reporting_week": "Week 2",
+                    "translator": "amelie.leroy",
+                    "translation_hours": "24",
+                    "rating": "4.8",
+                    "workflow_mode": "human_only",
+                    "manager_name": "Alex Dupont",
+                    "manager_email": "alex.dupont@legalservices.example",
+                },
             ),
-            client="Legal Services Co",
-            priority=ProjectPriority.CRITICAL,
-            due_date=now + timedelta(days=1),
-            estimated_word_count=2300,
-            budget=3200.0,
-            description="Contract localization for cross-border compliance.",
-            assigned_vendor_id=vendors[1].id,
-            connector_id=connectors[3].id,
-            metadata={
-                "reporting_week": "Week 2",
-                "translator": "amelie.leroy",
-                "translation_hours": "24",
-                "rating": "4.8",
-            },
-        ),
-        ProjectCreate(
-            name="Marketing Copy EN-DE",
-            sector="ecommerce",
-            source_locale="en-US",
-            target_locales=["de-DE"],
-            content=(
-                "Flash sale ends tonight!\n"
-                "Secure payment portal with express checkout."
+            ProjectCreate(
+                name="Marketing Copy EN-DE",
+                sector="ecommerce",
+                source_locale="en-US",
+                target_locales=["de-DE"],
+                content=(
+                    "Flash sale ends tonight!\n"
+                    "Secure payment portal with express checkout."
+                ),
+                client="Global Marketing",
+                priority=ProjectPriority.MEDIUM,
+                due_date=now + timedelta(days=4),
+                estimated_word_count=950,
+                budget=1280.0,
+                description="Homepage hero and campaign banners for EU region.",
+                assigned_vendor_id=vendors[0].id if vendors else None,
+                connector_id=connectors[1].id if len(connectors) > 1 else None,
+                metadata={
+                    "reporting_week": "Week 3",
+                    "translator": "hannah.mueller",
+                    "translation_hours": "9",
+                    "rating": "4.7",
+                    "workflow_mode": "nmt_first",
+                    "manager_name": "Priya Das",
+                    "manager_email": "priya.das@globalmarketing.example",
+                },
             ),
-            client="Global Marketing",
-            priority=ProjectPriority.MEDIUM,
-            due_date=now + timedelta(days=4),
-            estimated_word_count=950,
-            budget=1280.0,
-            description="Homepage hero and campaign banners for EU region.",
-            assigned_vendor_id=vendors[0].id,
-            connector_id=connectors[1].id,
-            metadata={
-                "reporting_week": "Week 3",
-                "translator": "hannah.mueller",
-                "translation_hours": "9",
-                "rating": "4.7",
-            },
-        ),
-        ProjectCreate(
-            name="Website Content ES-EN",
-            sector="bfsi",
-            source_locale="es-ES",
-            target_locales=["en-US"],
-            content=(
-                "La actualización de seguridad entra en vigor hoy.\n"
-                "Los clientes deben confirmar su número de cuenta."
+            ProjectCreate(
+                name="Website Content ES-EN",
+                sector="bfsi",
+                source_locale="es-ES",
+                target_locales=["en-US"],
+                content=(
+                    "La actualización de seguridad entra en vigor hoy.\n"
+                    "Los clientes deben confirmar su número de cuenta."
+                ),
+                client="Banca Segura",
+                priority=ProjectPriority.HIGH,
+                due_date=now + timedelta(days=3),
+                estimated_word_count=1600,
+                budget=2100.0,
+                description="Customer portal update for security procedures.",
+                assigned_vendor_id=vendors[0].id if vendors else None,
+                connector_id=connectors[2].id if len(connectors) > 2 else None,
+                metadata={
+                    "reporting_week": "Week 4",
+                    "translator": "marco.rivera",
+                    "translation_hours": "15",
+                    "rating": "4.6",
+                    "workflow_mode": "human_post_edit",
+                    "manager_name": "Diego Alvarez",
+                    "manager_email": "diego.alvarez@bancasegura.example",
+                },
             ),
-            client="Banca Segura",
-            priority=ProjectPriority.HIGH,
-            due_date=now + timedelta(days=3),
-            estimated_word_count=1600,
-            budget=2100.0,
-            description="Customer portal update for security procedures.",
-            assigned_vendor_id=vendors[0].id,
-            connector_id=connectors[2].id,
-            metadata={
-                "reporting_week": "Week 4",
-                "translator": "marco.rivera",
-                "translation_hours": "15",
-                "rating": "4.6",
-            },
-        ),
-    ]
+        ]
 
-    created_jobs = [project_service.create_project(payload) for payload in project_payloads]
+        created_jobs = [project_service.create_project(payload) for payload in project_payloads]
 
-    # Manually adjust workflow states and progress to mirror dashboard visuals
-    for job in created_jobs:
-        if job.workflow:
-            job.workflow[0].status = WorkflowStepStatus.COMPLETED
-            if len(job.workflow) > 1:
-                job.workflow[1].status = WorkflowStepStatus.IN_PROGRESS
-        job.status = workflow_status(job.workflow)
-        job.progress = project_service.recalculate_progress(job)
-        state.update_job(job)
+        # Manually adjust workflow states and progress to mirror dashboard visuals
+        for job in created_jobs:
+            if job.workflow:
+                job.workflow[0].status = WorkflowStepStatus.COMPLETED
+                if len(job.workflow) > 1:
+                    job.workflow[1].status = WorkflowStepStatus.IN_PROGRESS
+            job.status = workflow_status(job.workflow)
+            job.progress = project_service.recalculate_progress(job)
+            state.update_job(job)
+            project_service.sync_job(job)
 
-    # Apply sample post edits to reflect human in the loop actions
-    for job in created_jobs:
-        for segment in job.segments[:1]:
-            segment.post_edit = f"{segment.nmt_suggestion} (reviewed)"
-        job.progress = project_service.recalculate_progress(job)
-        job.last_updated = datetime.utcnow()
-        state.update_job(job)
+        # Apply sample post edits to reflect human in the loop actions
+        for job in created_jobs:
+            for segment in job.segments[:1]:
+                segment.post_edit = f"{segment.nmt_suggestion} (reviewed)"
+            job.progress = project_service.recalculate_progress(job)
+            job.last_updated = datetime.utcnow()
+            state.update_job(job)
+            project_service.sync_job(job)
 
-    # Sample activity log aligned with dashboard visuals
-    state.record_activity_message(
-        category="project",
-        message="New project from Client #23 – due in 3 days.",
-    )
-    state.record_activity_message(
-        category="finance",
-        message="Payment received: $1,250 for 'Marketing Copy'.",
-    )
-    state.record_activity_message(
-        category="workflow",
-        message="Translator review completed for 'Legal Document'.",
-    )
+        # Sample activity log aligned with dashboard visuals
+        state.record_activity_message(
+            category="project",
+            message="New project from Client #23 – due in 3 days.",
+        )
+        state.record_activity_message(
+            category="finance",
+            message="Payment received: $1,250 for 'Marketing Copy'.",
+        )
+        state.record_activity_message(
+            category="workflow",
+            message="Translator review completed for 'Legal Document'.",
+        )
 
     # Time tracking and utilisation metrics used by analytics dashboard
     state.set_time_tracking(

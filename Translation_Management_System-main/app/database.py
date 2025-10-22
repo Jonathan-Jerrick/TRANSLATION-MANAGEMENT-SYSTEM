@@ -5,15 +5,24 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-# Database URL from environment
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://tms_user:tms_password@localhost:5432/tms_db")
+# Database URL from environment with a sensible local default
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tms.db")
 
 # Create engine
+engine_kwargs = {"echo": False}
+if DATABASE_URL.startswith("sqlite"):
+    engine_kwargs.update(
+        {
+            "poolclass": StaticPool,
+            "connect_args": {"check_same_thread": False},
+        }
+    )
+else:
+    engine_kwargs["pool_pre_ping"] = True
+
 engine = create_engine(
     DATABASE_URL,
-    poolclass=StaticPool,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-    echo=False
+    **engine_kwargs,
 )
 
 # Create session factory

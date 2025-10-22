@@ -61,6 +61,11 @@ class ApiService {
     return response.data;
   }
 
+  async getLocales() {
+    const response = await this.api.get('/locales');
+    return response.data;
+  }
+
   // Projects endpoints
   async getProjects() {
     const response = await this.api.get('/projects');
@@ -95,7 +100,7 @@ class ApiService {
 
   async updateSegment(projectId: string, segmentId: string, updates: any) {
     const response = await this.api.post(
-      `/projects/${projectId}/segments/${segmentId}/update`,
+      `/projects/${projectId}/segments/${segmentId}`,
       updates
     );
     return response.data;

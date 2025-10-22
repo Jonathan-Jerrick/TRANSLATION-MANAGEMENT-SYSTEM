@@ -1,14 +1,18 @@
 """Service layer implementing translation memory, NMT, and project helpers."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 from uuid import uuid4
+
+from sqlalchemy.orm import Session
 
 from .models import (
     Job,
+    JobStatus,
     JobStepCompletion,
     ProjectCreate,
     QAInsight,
@@ -19,7 +23,21 @@ from .models import (
     TermEntry,
     TranslationMemoryEntry,
     TranslationSegment,
+    WorkflowStep,
     WorkflowStepStatus,
+)
+from .db_models import (
+    JobStatus as ORMJobStatus,
+    Project as ORMProject,
+    ProjectPriority as ORMProjectPriority,
+    QualityReport as ORMQualityReport,
+    RiskLevel as ORMRiskLevel,
+    TermEntry as ORMTermEntry,
+    TranslationSegment as ORMTranslationSegment,
+    TranslationMemory as ORMTranslationMemory,
+    User as ORMUser,
+    WorkflowStep as ORMWorkflowStep,
+    WorkflowStepStatus as ORMWorkflowStepStatus,
 )
 from .state import State
 from .workflows import advance_workflow, build_workflow, workflow_status
@@ -38,8 +56,44 @@ class NMTOutput:
 class TranslationMemoryService:
     """Simple fuzzy lookup for translation memory suggestions."""
 
-    def __init__(self, state: State) -> None:
+    def __init__(self, state: State, session_factory: Optional[Callable[[], Session]] = None) -> None:
         self._state = state
+        self._session_factory = session_factory
+
+    @contextmanager
+    def _session_scope(self):
+        if self._session_factory is None:
+            yield None
+            return
+        session = self._session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def load_from_db(self) -> None:
+        if not self._session_factory:
+            return
+        session = self._session_factory()
+        try:
+            records = session.query(ORMTranslationMemory).all()
+            for record in records:
+                entry = TranslationMemoryEntry(
+                    id=str(record.id),
+                    source_locale=record.source_locale,
+                    target_locale=record.target_locale,
+                    source_text=record.source_text,
+                    translated_text=record.translated_text,
+                    created_at=record.created_at,
+                    usage_count=record.usage_count,
+                )
+                self._state.add_translation_memory_entry(entry)
+        finally:
+            session.close()
 
     def add_entry(
         self,
@@ -56,7 +110,9 @@ class TranslationMemoryService:
             translated_text=translated_text,
             created_at=datetime.utcnow(),
         )
-        return self._state.add_translation_memory_entry(entry)
+        stored_entry = self._state.add_translation_memory_entry(entry)
+        self._persist_entry(stored_entry)
+        return stored_entry
 
     def lookup(
         self, source_locale: str, target_locale: str, source_text: str
@@ -71,17 +127,82 @@ class TranslationMemoryService:
                 best_entry = entry
         if best_entry:
             best_entry.usage_count += 1
+            self._persist_usage(best_entry)
         return best_entry if best_score >= 0.6 else None
 
     def list_entries(self, source_locale: str, target_locale: str) -> List[TranslationMemoryEntry]:
         return self._state.list_translation_memory(source_locale, target_locale)
 
+    def _persist_entry(self, entry: TranslationMemoryEntry) -> None:
+        with self._session_scope() as session:
+            if session is None:
+                return
+            session.merge(
+                ORMTranslationMemory(
+                    id=entry.id,
+                    source_locale=entry.source_locale,
+                    target_locale=entry.target_locale,
+                    source_text=entry.source_text,
+                    translated_text=entry.translated_text,
+                    created_at=entry.created_at,
+                    usage_count=entry.usage_count,
+                )
+            )
+
+    def _persist_usage(self, entry: TranslationMemoryEntry) -> None:
+        if not self._session_factory:
+            return
+        session = self._session_factory()
+        try:
+            record = session.get(ORMTranslationMemory, entry.id)
+            if record:
+                record.usage_count = entry.usage_count
+                session.commit()
+        finally:
+            session.close()
+
 
 class TermBaseService:
     """Sector-aware term base helper service."""
 
-    def __init__(self, state: State) -> None:
+    def __init__(self, state: State, session_factory: Optional[Callable[[], Session]] = None) -> None:
         self._state = state
+        self._session_factory = session_factory
+
+    @contextmanager
+    def _session_scope(self):
+        if self._session_factory is None:
+            yield None
+            return
+        session = self._session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def load_from_db(self) -> None:
+        if not self._session_factory:
+            return
+        session = self._session_factory()
+        try:
+            records = session.query(ORMTermEntry).all()
+            for record in records:
+                entry = TermEntry(
+                    id=str(record.id),
+                    sector=record.sector,
+                    source_locale=record.source_locale,
+                    target_locale=record.target_locale,
+                    term=record.term,
+                    translation=record.translation,
+                    notes=record.notes,
+                )
+                self._state.add_term_entry(entry)
+        finally:
+            session.close()
 
     def add_entry(
         self,
@@ -101,7 +222,9 @@ class TermBaseService:
             translation=translation,
             notes=notes,
         )
-        return self._state.add_term_entry(entry)
+        stored_entry = self._state.add_term_entry(entry)
+        self._persist_entry(stored_entry)
+        return stored_entry
 
     def lookup(
         self, sector: str, source_locale: str, target_locale: str, source_text: str
@@ -114,6 +237,22 @@ class TermBaseService:
         self, sector: str, source_locale: str, target_locale: str
     ) -> List[TermEntry]:
         return self._state.list_term_entries(sector, source_locale, target_locale)
+
+    def _persist_entry(self, entry: TermEntry) -> None:
+        with self._session_scope() as session:
+            if session is None:
+                return
+            session.merge(
+                ORMTermEntry(
+                    id=entry.id,
+                    sector=entry.sector,
+                    source_locale=entry.source_locale,
+                    target_locale=entry.target_locale,
+                    term=entry.term,
+                    translation=entry.translation,
+                    notes=entry.notes,
+                )
+            )
 
 
 class NMTService:
@@ -247,7 +386,7 @@ def build_segment(
 class ProjectService:
     """Coordinates project creation, CAT updates, and studio snapshots."""
 
-    MANUAL_CONNECTOR_ID = "manual-intake"
+    MANUAL_CONNECTOR_ID = "00000000-0000-0000-0000-000000000001"
 
     def __init__(
         self,
@@ -255,11 +394,40 @@ class ProjectService:
         tm_service: TranslationMemoryService,
         term_service: TermBaseService,
         nmt_service: NMTService,
+        session_factory: Optional[Callable[[], Session]] = None,
     ) -> None:
         self._state = state
         self._tm_service = tm_service
         self._term_service = term_service
         self._nmt_service = nmt_service
+        self._session_factory = session_factory
+
+    @contextmanager
+    def _session_scope(self):
+        if self._session_factory is None:
+            yield None
+            return
+        session = self._session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def load_from_db(self) -> None:
+        if not self._session_factory:
+            return
+        session = self._session_factory()
+        try:
+            projects = session.query(ORMProject).all()
+            for project in projects:
+                job = self._job_from_orm(project)
+                self._state.add_job(job)
+        finally:
+            session.close()
 
     def create_project(self, payload: ProjectCreate) -> Job:
         connector_id = payload.connector_id or self.MANUAL_CONNECTOR_ID
@@ -270,17 +438,22 @@ class ProjectService:
             payload.target_locales,
             payload.sector,
         )
+        metadata = dict(payload.metadata)
+        if payload.created_by_id:
+            metadata["created_by_id"] = payload.created_by_id
+        metadata.setdefault("workflow_mode", metadata.get("workflow_mode", "human_post_edit"))
+        metadata.setdefault("_source_content", payload.content)
         job = Job(
             id=str(uuid4()),
             connector_id=connector_id,
-            content_id=payload.metadata.get("content_id", payload.name),
+            content_id=metadata.get("content_id", payload.name),
             sector=payload.sector,
             source_locale=payload.source_locale,
             target_locales=payload.target_locales,
             created_at=datetime.utcnow(),
             workflow=workflow,
             segments=segments,
-            metadata=dict(payload.metadata),
+            metadata=metadata,
             name=payload.name,
             client=payload.client,
             priority=payload.priority.value if payload.priority else None,
@@ -292,12 +465,166 @@ class ProjectService:
         )
         job.status = workflow_status(job.workflow)
         job.progress = self.recalculate_progress(job)
+        if payload.created_by_id:
+            job.metadata["created_by_id"] = payload.created_by_id
         self._state.add_job(job)
+        self._persist_job(job, payload)
         self._state.record_activity_message(
             category="project",
             message=f"Created project '{job.name or job.content_id}' for {job.sector.title()} sector.",
         )
         return job
+
+    def list_projects(self) -> List[Job]:
+        return sorted(self._state.list_jobs(), key=lambda job: job.created_at, reverse=True)
+
+    def list_projects_for_user(self, user: ORMUser) -> List[Job]:
+        role = getattr(user.role, "label", str(user.role).lower())
+        jobs = self.list_projects()
+        if role == "manager":
+            manager_id = str(user.id)
+            return [
+                job
+                for job in jobs
+                if job.metadata.get("created_by_id") in {manager_id, None, "",}
+            ]
+        if role == "translator":
+            return [job for job in jobs if job.status != JobStatus.COMPLETED]
+        return jobs
+
+    def get_project(self, project_id: str) -> Job:
+        try:
+            return self._state.get_job(project_id)
+        except KeyError:
+            self._reload_project(project_id)
+            return self._state.get_job(project_id)
+
+    def update_segment(self, project_id: str, segment_id: str, update: SegmentUpdate) -> TranslationSegment:
+        job = self._state.get_job(project_id)
+        target_segment = next((segment for segment in job.segments if segment.id == segment_id), None)
+        if target_segment is None:
+            raise KeyError(segment_id)
+        if update.post_edit is not None:
+            target_segment.post_edit = update.post_edit
+        if update.reviewer_notes is not None:
+            target_segment.reviewer_notes = update.reviewer_notes
+        target_segment.last_updated = datetime.utcnow()
+        job.progress = self.recalculate_progress(job)
+        job.last_updated = datetime.utcnow()
+        self._state.update_job(job)
+        self._persist_job(job)
+        self._state.record_activity_message(
+            category="cat",
+            message=f"Updated segment in project '{job.name or job.content_id}'.",
+        )
+        return target_segment
+
+    def sync_job(self, job: Job) -> None:
+        self._persist_job(job)
+
+    def _persist_job(self, job: Job, payload: Optional[ProjectCreate] = None) -> None:
+        if not self._session_factory:
+            return
+        metadata = dict(job.metadata)
+        if payload:
+            metadata.update(payload.metadata)
+            if payload.created_by_id:
+                metadata["created_by_id"] = payload.created_by_id
+            metadata["_source_content"] = payload.content
+        metadata = {
+            str(key): (value if isinstance(value, str) else str(value) if value is not None else "")
+            for key, value in metadata.items()
+        }
+        with self._session_scope() as session:
+            if session is None:
+                return
+            project = session.get(ORMProject, job.id)
+            if project is None:
+                project = ORMProject(id=job.id, created_at=job.created_at)
+                session.add(project)
+            project.name = job.name or job.content_id
+            project.sector = job.sector
+            project.source_locale = job.source_locale
+            project.target_locales = job.target_locales
+            project.client = job.client
+            project.priority = None
+            if payload and payload.priority:
+                project.priority = ORMProjectPriority(payload.priority.value)
+            elif job.priority:
+                project.priority = ORMProjectPriority(job.priority)
+            project.due_date = job.due_date
+            project.estimated_word_count = job.estimated_word_count
+            project.budget = job.budget
+            project.description = job.description
+            project.connector_id = job.connector_id
+            project.assigned_vendor_id = job.assigned_vendor_id
+            created_by = metadata.get("created_by_id")
+            if created_by:
+                project.assigned_user_id = created_by
+            project.status = ORMJobStatus(job.status.value if isinstance(job.status, JobStatus) else str(job.status))
+            project.progress = job.progress
+            project.config_data = metadata
+            source_content = metadata.get("_source_content")
+            if payload and payload.content:
+                project.content = payload.content
+            elif source_content:
+                project.content = source_content
+            project.updated_at = datetime.utcnow()
+            session.flush()
+            session.query(ORMTranslationSegment).filter(
+                ORMTranslationSegment.project_id == project.id
+            ).delete(synchronize_session=False)
+            session.query(ORMWorkflowStep).filter(
+                ORMWorkflowStep.project_id == project.id
+            ).delete(synchronize_session=False)
+            session.query(ORMQualityReport).filter(
+                ORMQualityReport.project_id == project.id
+            ).delete(synchronize_session=False)
+            for order, step in enumerate(job.workflow):
+                session.add(
+                    ORMWorkflowStep(
+                        project_id=project.id,
+                        name=step.name,
+                        automated=step.automated,
+                        assignee=step.assignee,
+                        status=ORMWorkflowStepStatus(step.status.value if isinstance(step.status, WorkflowStepStatus) else step.status),
+                        order=order,
+                        completed_at=datetime.utcnow() if step.status == WorkflowStepStatus.COMPLETED else None,
+                    )
+                )
+            for segment in job.segments:
+                session.add(
+                    ORMTranslationSegment(
+                        id=segment.id,
+                        project_id=project.id,
+                        source_text=segment.source_text,
+                        target_locale=segment.target_locale,
+                        tm_suggestion=segment.tm_suggestion,
+                        tm_score=segment.tm_score,
+                        nmt_suggestion=segment.nmt_suggestion,
+                        post_edit=segment.post_edit,
+                        reviewer_notes=segment.reviewer_notes,
+                        risk_level=ORMRiskLevel(
+                            segment.risk_level.value if isinstance(segment.risk_level, RiskLevel) else segment.risk_level
+                        )
+                        if segment.risk_level
+                        else None,
+                        quality_estimate=segment.quality_estimate,
+                        qa_flags=segment.qa_flags,
+                        term_hits=segment.term_hits,
+                    )
+                )
+            for report in job.quality_reports:
+                session.add(
+                    ORMQualityReport(
+                        project_id=project.id,
+                        mtqe_score=report.mtqe_score,
+                        mqm_errors=report.mqm_errors,
+                        comments=report.comments,
+                        submitted_at=report.submitted_at,
+                        compliance_flags=report.compliance_flags,
+                    )
+                )
 
     def _build_segments(
         self,
@@ -323,36 +650,94 @@ class ProjectService:
                 )
         return segments
 
-    def list_projects(self) -> List[Job]:
-        return self._state.list_jobs()
+    def _reload_project(self, project_id: str) -> None:
+        if not self._session_factory:
+            raise KeyError(project_id)
+        session = self._session_factory()
+        try:
+            project = session.get(ORMProject, project_id)
+            if project is None:
+                raise KeyError(project_id)
+            job = self._job_from_orm(project)
+            self._state.update_job(job)
+        finally:
+            session.close()
 
-    def get_project(self, project_id: str) -> Job:
-        return self._state.get_job(project_id)
-
-    def update_segment(self, project_id: str, segment_id: str, update: SegmentUpdate) -> TranslationSegment:
-        job = self._state.get_job(project_id)
-        target_segment = next((segment for segment in job.segments if segment.id == segment_id), None)
-        if target_segment is None:
-            raise KeyError(segment_id)
-        if update.post_edit is not None:
-            target_segment.post_edit = update.post_edit
-        if update.reviewer_notes is not None:
-            target_segment.reviewer_notes = update.reviewer_notes
-        target_segment.last_updated = datetime.utcnow()
-        job.progress = self.recalculate_progress(job)
-        job.last_updated = datetime.utcnow()
-        self._state.update_job(job)
-        self._state.record_activity_message(
-            category="cat",
-            message=f"Updated segment in project '{job.name or job.content_id}'.",
+    def _job_from_orm(self, project: ORMProject) -> Job:
+        metadata = dict(project.config_data or {})
+        metadata.setdefault("_source_content", project.content or "")
+        if project.assigned_user_id:
+            metadata.setdefault("created_by_id", str(project.assigned_user_id))
+        workflow_steps = sorted(project.workflow_steps, key=lambda step: step.order or 0)
+        workflow = [
+            WorkflowStep(
+                name=step.name,
+                automated=step.automated,
+                assignee=step.assignee or "",
+                status=WorkflowStepStatus(step.status.value if step.status else WorkflowStepStatus.PENDING.value),
+            )
+            for step in workflow_steps
+        ]
+        segments = [
+            TranslationSegment(
+                id=str(segment.id),
+                source_text=segment.source_text,
+                target_locale=segment.target_locale,
+                tm_suggestion=segment.tm_suggestion,
+                tm_score=segment.tm_score,
+                nmt_suggestion=segment.nmt_suggestion,
+                post_edit=segment.post_edit,
+                reviewer_notes=segment.reviewer_notes,
+                risk_level=RiskLevel(segment.risk_level.value) if segment.risk_level else None,
+                quality_estimate=segment.quality_estimate,
+                qa_flags=segment.qa_flags or [],
+                term_hits=segment.term_hits or [],
+                last_updated=segment.updated_at,
+            )
+            for segment in project.segments
+        ]
+        quality_reports = [
+            QualityReport(
+                mtqe_score=report.mtqe_score,
+                mqm_errors=report.mqm_errors or {},
+                comments=report.comments,
+                submitted_at=report.submitted_at,
+                reviewer=report.reviewer.email if report.reviewer else None,
+                compliance_flags=report.compliance_flags or {},
+            )
+            for report in project.quality_reports
+        ]
+        job = Job(
+            id=str(project.id),
+            connector_id=project.connector_id,
+            content_id=metadata.get("content_id", project.name or str(project.id)),
+            sector=project.sector,
+            source_locale=project.source_locale,
+            target_locales=project.target_locales or [],
+            created_at=project.created_at or datetime.utcnow(),
+            status=JobStatus(project.status.value if project.status else JobStatus.INTAKE.value),
+            workflow=workflow,
+            segments=segments,
+            metadata={str(k): (v if isinstance(v, str) else str(v)) for k, v in metadata.items()},
+            quality_reports=quality_reports,
+            name=project.name,
+            client=project.client,
+            priority=project.priority.value if project.priority else None,
+            due_date=project.due_date,
+            estimated_word_count=project.estimated_word_count,
+            budget=project.budget,
+            description=project.description,
+            progress=project.progress or 0.0,
+            assigned_vendor_id=project.assigned_vendor_id,
+            last_updated=project.updated_at or project.created_at or datetime.utcnow(),
         )
-        return target_segment
+        return job
 
     def studio_snapshot(self, project_id: str, target_locale: str) -> StudioSnapshot:
-        job = self._state.get_job(project_id)
+        job = self.get_project(project_id)
         segments = [segment for segment in job.segments if segment.target_locale == target_locale]
         qa_insights = self._build_qa_insights(segments)
-        snapshot = StudioSnapshot(
+        return StudioSnapshot(
             project_id=job.id,
             project_name=job.name or job.content_id,
             source_locale=job.source_locale,
@@ -365,7 +750,6 @@ class ProjectService:
             workflow=job.workflow,
             progress=job.progress,
         )
-        return snapshot
 
     def _build_qa_insights(self, segments: Sequence[TranslationSegment]) -> List[QAInsight]:
         if not segments:
@@ -453,6 +837,7 @@ class JobService:
         job.progress = self._project_service.recalculate_progress(job)
         job.last_updated = datetime.utcnow()
         self._state.update_job(job)
+        self._project_service.sync_job(job)
         return job
 
     def add_quality_report(self, job: Job, report: QualityReport) -> Job:
@@ -461,4 +846,5 @@ class JobService:
         job.progress = self._project_service.recalculate_progress(job)
         job.last_updated = datetime.utcnow()
         self._state.update_job(job)
+        self._project_service.sync_job(job)
         return job

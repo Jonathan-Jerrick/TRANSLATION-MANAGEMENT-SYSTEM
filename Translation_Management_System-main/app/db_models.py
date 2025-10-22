@@ -1,22 +1,58 @@
 """SQLAlchemy database models for the Translation Management System."""
 from datetime import datetime
 from enum import Enum as PyEnum
-from typing import List, Optional
+import uuid
+
 from sqlalchemy import (
-    Boolean, Column, DateTime, Enum, Float, ForeignKey, Integer, 
-    JSON, String, Text, UUID, Index
+    Boolean,
+    Column,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    Index,
 )
 from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-import uuid
+from sqlalchemy.types import CHAR, TypeDecorator
 
 from .database import Base
 
 
+class GUID(TypeDecorator):
+    """Platform-independent GUID type."""
+
+    impl = PostgresUUID
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(PostgresUUID(as_uuid=True))
+        return dialect.type_descriptor(CHAR(36))
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return value
+        if isinstance(value, uuid.UUID):
+            value = str(value)
+        if dialect.name == "postgresql":
+            return uuid.UUID(str(value))
+        return str(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return value
+        return str(value)
+
+
 class ConnectorType(PyEnum):
-    CMS = "cms"
-    GIT = "git"
+    CMS = "CMS"
+    GIT = "GIT"
 
 
 class WorkflowStepStatus(PyEnum):
@@ -45,17 +81,22 @@ class RiskLevel(PyEnum):
 
 
 class UserRole(PyEnum):
-    ADMIN = "admin"
-    MANAGER = "manager"
-    TRANSLATOR = "translator"
-    REVIEWER = "reviewer"
-    CLIENT = "client"
+    ADMIN = "ADMIN"
+    MANAGER = "MANAGER"
+    TRANSLATOR = "TRANSLATOR"
+    REVIEWER = "REVIEWER"
+    CLIENT = "CLIENT"
+
+    @property
+    def label(self) -> str:
+        """Lowercase representation used by API responses."""
+        return self.value.lower()
 
 
 class User(Base):
     __tablename__ = "users"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, index=True, nullable=False)
     username = Column(String(100), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
@@ -74,7 +115,7 @@ class User(Base):
 class Connector(Base):
     __tablename__ = "connectors"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
     type = Column(Enum(ConnectorType), nullable=False)
     sector = Column(String(100), nullable=False)
@@ -93,7 +134,7 @@ class Connector(Base):
 class Vendor(Base):
     __tablename__ = "vendors"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
     sectors = Column(JSON)  # List of sectors
     locales = Column(JSON)  # List of supported locales
@@ -109,7 +150,7 @@ class Vendor(Base):
 class Project(Base):
     __tablename__ = "projects"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False, index=True)
     sector = Column(String(100), nullable=False)
     source_locale = Column(String(10), nullable=False)
@@ -128,9 +169,9 @@ class Project(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     
     # Foreign keys
-    connector_id = Column(PostgresUUID(as_uuid=True), ForeignKey("connectors.id"))
-    assigned_vendor_id = Column(PostgresUUID(as_uuid=True), ForeignKey("vendors.id"))
-    assigned_user_id = Column(PostgresUUID(as_uuid=True), ForeignKey("users.id"))
+    connector_id = Column(GUID(), ForeignKey("connectors.id"))
+    assigned_vendor_id = Column(GUID(), ForeignKey("vendors.id"))
+    assigned_user_id = Column(GUID(), ForeignKey("users.id"))
     
     # Relationships
     connector = relationship("Connector", back_populates="projects")
@@ -144,7 +185,7 @@ class Project(Base):
 class WorkflowStep(Base):
     __tablename__ = "workflow_steps"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     name = Column(String(100), nullable=False)
     automated = Column(Boolean, default=False)
     assignee = Column(String(255))
@@ -154,7 +195,7 @@ class WorkflowStep(Base):
     completed_at = Column(DateTime)
     
     # Foreign key
-    project_id = Column(PostgresUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False)
+    project_id = Column(GUID(), ForeignKey("projects.id"), nullable=False)
     
     # Relationships
     project = relationship("Project", back_populates="workflow_steps")
@@ -163,7 +204,7 @@ class WorkflowStep(Base):
 class TranslationSegment(Base):
     __tablename__ = "translation_segments"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     source_text = Column(Text, nullable=False)
     target_locale = Column(String(10), nullable=False)
     tm_suggestion = Column(Text)
@@ -179,7 +220,7 @@ class TranslationSegment(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     
     # Foreign key
-    project_id = Column(PostgresUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False)
+    project_id = Column(GUID(), ForeignKey("projects.id"), nullable=False)
     
     # Relationships
     project = relationship("Project", back_populates="segments")
@@ -188,7 +229,7 @@ class TranslationSegment(Base):
 class TranslationMemory(Base):
     __tablename__ = "translation_memory"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     source_locale = Column(String(10), nullable=False)
     target_locale = Column(String(10), nullable=False)
     source_text = Column(Text, nullable=False)
@@ -207,7 +248,7 @@ class TranslationMemory(Base):
 class TermEntry(Base):
     __tablename__ = "term_entries"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     sector = Column(String(100), nullable=False)
     source_locale = Column(String(10), nullable=False)
     target_locale = Column(String(10), nullable=False)
@@ -226,7 +267,7 @@ class TermEntry(Base):
 class QualityReport(Base):
     __tablename__ = "quality_reports"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     mtqe_score = Column(Float, nullable=False)
     mqm_errors = Column(JSON)  # Dict of error types and counts
     comments = Column(Text)
@@ -234,8 +275,8 @@ class QualityReport(Base):
     compliance_flags = Column(JSON)  # Dict of compliance flags
     
     # Foreign keys
-    project_id = Column(PostgresUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False)
-    reviewer_id = Column(PostgresUUID(as_uuid=True), ForeignKey("users.id"))
+    project_id = Column(GUID(), ForeignKey("projects.id"), nullable=False)
+    reviewer_id = Column(GUID(), ForeignKey("users.id"))
     
     # Relationships
     project = relationship("Project", back_populates="quality_reports")
@@ -245,11 +286,11 @@ class QualityReport(Base):
 class ActivityLog(Base):
     __tablename__ = "activity_logs"
     
-    id = Column(PostgresUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     message = Column(Text, nullable=False)
     category = Column(String(50), nullable=False)
-    user_id = Column(PostgresUUID(as_uuid=True), ForeignKey("users.id"))
-    project_id = Column(PostgresUUID(as_uuid=True), ForeignKey("projects.id"))
+    user_id = Column(GUID(), ForeignKey("users.id"))
+    project_id = Column(GUID(), ForeignKey("projects.id"))
     created_at = Column(DateTime, default=func.now())
     
     # Indexes

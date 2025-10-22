@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { devtools } from 'zustand/middleware';
+import { devtools, persist, createJSONStorage } from 'zustand/middleware';
 
 export interface User {
   id: string;
@@ -25,6 +25,20 @@ export interface Project {
   priority?: 'low' | 'medium' | 'high' | 'critical';
   assigned_vendor_id?: string;
   assigned_user_id?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface ProjectDraft {
+  name: string;
+  sector: string;
+  source_locale: string;
+  target_locales: string[];
+  content: string;
+  description?: string;
+  client?: string;
+  priority: 'low' | 'medium' | 'high' | 'critical';
+  due_date?: string;
+  workflow_mode: 'human_post_edit' | 'human_only' | 'nmt_first' | 'full_llm';
 }
 
 export interface TranslationSegment {
@@ -54,25 +68,27 @@ export interface WebSocketMessage {
   [key: string]: any;
 }
 
+type PageState = Record<string, unknown>;
+
 interface AppState {
   // User state
   user: User | null;
   isAuthenticated: boolean;
   token: string | null;
-  
+
   // Projects state
   projects: Project[];
   currentProject: Project | null;
-  
+
   // Translation state
   segments: TranslationSegment[];
   currentSegment: TranslationSegment | null;
-  
+
   // WebSocket state
   isConnected: boolean;
   collaborators: string[];
-  typingUsers: { [segmentId: string]: string[] };
-  
+  typingUsers: Record<string, string[]>;
+
   // UI state
   isLoading: boolean;
   error: string | null;
@@ -82,7 +98,12 @@ interface AppState {
     message: string;
     timestamp: number;
   }>;
-  
+
+  // Navigation & persistence
+  lastVisitedRoute: string;
+  pageState: PageState;
+  projectDraft: ProjectDraft;
+
   // Actions
   setUser: (user: User | null) => void;
   setToken: (token: string | null) => void;
@@ -100,157 +121,272 @@ interface AppState {
   setTypingUsers: (segmentId: string, users: string[]) => void;
   clearTypingUsers: (segmentId: string) => void;
   handleWebSocketMessage: (message: WebSocketMessage) => void;
+  setLastVisitedRoute: (route: string) => void;
+  updatePageState: <T>(key: string, value: Partial<T> | T | ((previous?: T) => T)) => void;
+  clearPageState: (key?: string) => void;
+  setProjectDraft: (updates: Partial<ProjectDraft> | ((draft: ProjectDraft) => ProjectDraft)) => void;
+  resetProjectDraft: () => void;
   logout: () => void;
 }
 
+const noopStorage = {
+  getItem: () => null,
+  setItem: () => undefined,
+  removeItem: () => undefined,
+  clear: () => undefined,
+  key: () => null,
+  length: 0,
+} as Storage;
+
+const defaultProjectDraft: ProjectDraft = {
+  name: '',
+  sector: '',
+  source_locale: '',
+  target_locales: [],
+  content: '',
+  description: '',
+  client: '',
+  priority: 'medium',
+  due_date: '',
+  workflow_mode: 'human_post_edit',
+};
+
+const getInitialToken = () =>
+  typeof window !== 'undefined' ? window.localStorage.getItem('token') : null;
+
 export const useStore = create<AppState>()(
   devtools(
-    (set, get) => ({
-      // Initial state
-      user: null,
-      isAuthenticated: false,
-      token: localStorage.getItem('token'),
-      
-      projects: [],
-      currentProject: null,
-      
-      segments: [],
-      currentSegment: null,
-      
-      isConnected: false,
-      collaborators: [],
-      typingUsers: {},
-      
-      isLoading: false,
-      error: null,
-      notifications: [],
-      
-      // Actions
-      setUser: (user) => set({ user, isAuthenticated: !!user }),
-      
-      setToken: (token) => {
-        set({ token });
-        if (token) {
-          localStorage.setItem('token', token);
-        } else {
-          localStorage.removeItem('token');
-        }
-      },
-      
-      setProjects: (projects) => set({ projects }),
-      
-      setCurrentProject: (currentProject) => set({ currentProject }),
-      
-      setSegments: (segments) => set({ segments }),
-      
-      setCurrentSegment: (currentSegment) => set({ currentSegment }),
-      
-      updateSegment: (segmentId, updates) => set((state) => ({
-        segments: state.segments.map(segment =>
-          segment.id === segmentId ? { ...segment, ...updates } : segment
-        ),
-        currentSegment: state.currentSegment?.id === segmentId
-          ? { ...state.currentSegment, ...updates }
-          : state.currentSegment
-      })),
-      
-      setLoading: (isLoading) => set({ isLoading }),
-      
-      setError: (error) => set({ error }),
-      
-      addNotification: (notification) => set((state) => ({
-        notifications: [
-          ...state.notifications,
-          {
-            ...notification,
-            id: Math.random().toString(36).substr(2, 9),
-            timestamp: Date.now()
-          }
-        ]
-      })),
-      
-      removeNotification: (id) => set((state) => ({
-        notifications: state.notifications.filter(n => n.id !== id)
-      })),
-      
-      setWebSocketConnected: (isConnected) => set({ isConnected }),
-      
-      setCollaborators: (collaborators) => set({ collaborators }),
-      
-      setTypingUsers: (segmentId, users) => set((state) => ({
-        typingUsers: {
-          ...state.typingUsers,
-          [segmentId]: users
-        }
-      })),
-      
-      clearTypingUsers: (segmentId) => set((state) => {
-        const newTypingUsers = { ...state.typingUsers };
-        delete newTypingUsers[segmentId];
-        return { typingUsers: newTypingUsers };
-      }),
-      
-      handleWebSocketMessage: (message) => {
-        const { type, user_id, project_id, segment_id, content, timestamp } = message;
-        
-        switch (type) {
-          case 'user_joined':
-            set((state) => ({
-              collaborators: [...state.collaborators, user_id!]
-            }));
-            break;
-            
-          case 'user_left':
-            set((state) => ({
-              collaborators: state.collaborators.filter(id => id !== user_id)
-            }));
-            break;
-            
-          case 'segment_updated':
-            if (segment_id && content) {
-              get().updateSegment(segment_id, { post_edit: content });
-            }
-            break;
-            
-          case 'typing':
-            if (segment_id && user_id) {
-              const { typingUsers } = get();
-              const currentUsers = typingUsers[segment_id] || [];
-              const newUsers = message.is_typing
-                ? [...currentUsers.filter(id => id !== user_id), user_id]
-                : currentUsers.filter(id => id !== user_id);
-              
-              get().setTypingUsers(segment_id, newUsers);
-            }
-            break;
-            
-          case 'cursor_position':
-            // Handle cursor position updates
-            break;
-            
-          case 'comment_added':
-            // Handle new comments
-            break;
-        }
-      },
-      
-      logout: () => set({
+    persist(
+      (set, get) => ({
+        // Initial state
         user: null,
-        isAuthenticated: false,
-        token: null,
+        isAuthenticated: !!getInitialToken(),
+        token: getInitialToken(),
+
         projects: [],
         currentProject: null,
+
         segments: [],
         currentSegment: null,
+
         isConnected: false,
         collaborators: [],
         typingUsers: {},
+
+        isLoading: false,
         error: null,
-        notifications: []
-      })
-    }),
-    {
-      name: 'tms-store'
-    }
-  )
+        notifications: [],
+        lastVisitedRoute: '/dashboard',
+        pageState: {},
+        projectDraft: defaultProjectDraft,
+
+        // Actions
+        setUser: (user) => set({ user, isAuthenticated: !!user }),
+
+        setToken: (token) => {
+          set({ token, isAuthenticated: !!token });
+          if (typeof window !== 'undefined') {
+            if (token) {
+              window.localStorage.setItem('token', token);
+            } else {
+              window.localStorage.removeItem('token');
+            }
+          }
+        },
+
+        setProjects: (projects) => set({ projects }),
+
+        setCurrentProject: (currentProject) => set({ currentProject }),
+
+        setSegments: (segments) => set({ segments }),
+
+        setCurrentSegment: (currentSegment) => set({ currentSegment }),
+
+        updateSegment: (segmentId, updates) =>
+          set((state) => ({
+            segments: state.segments.map((segment) =>
+              segment.id === segmentId ? { ...segment, ...updates } : segment,
+            ),
+            currentSegment:
+              state.currentSegment?.id === segmentId
+                ? { ...state.currentSegment, ...updates }
+                : state.currentSegment,
+          })),
+
+        setLoading: (isLoading) => set({ isLoading }),
+
+        setError: (error) => set({ error }),
+
+        addNotification: (notification) =>
+          set((state) => ({
+            notifications: [
+              ...state.notifications,
+              {
+                ...notification,
+                id: Math.random().toString(36).slice(2, 11),
+                timestamp: Date.now(),
+              },
+            ],
+          })),
+
+        removeNotification: (id) =>
+          set((state) => ({
+            notifications: state.notifications.filter((n) => n.id !== id),
+          })),
+
+        setWebSocketConnected: (isConnected) => set({ isConnected }),
+
+        setCollaborators: (collaborators) => set({ collaborators }),
+
+        setTypingUsers: (segmentId, users) =>
+          set((state) => ({
+            typingUsers: {
+              ...state.typingUsers,
+              [segmentId]: users,
+            },
+          })),
+
+        clearTypingUsers: (segmentId) =>
+          set((state) => {
+            const newTypingUsers = { ...state.typingUsers };
+            delete newTypingUsers[segmentId];
+            return { typingUsers: newTypingUsers };
+          }),
+
+        handleWebSocketMessage: (message) => {
+          const { type, user_id, segment_id, content } = message;
+
+          switch (type) {
+            case 'user_joined':
+              set((state) => ({
+                collaborators: [...state.collaborators, user_id!],
+              }));
+              break;
+
+            case 'user_left':
+              set((state) => ({
+                collaborators: state.collaborators.filter((id) => id !== user_id),
+              }));
+              break;
+
+            case 'segment_updated':
+              if (segment_id && content) {
+                get().updateSegment(segment_id, { post_edit: content });
+              }
+              break;
+
+            case 'typing':
+              if (segment_id && user_id) {
+                const { typingUsers } = get();
+                const currentUsers = typingUsers[segment_id] || [];
+                const newUsers = message.is_typing
+                  ? [...currentUsers.filter((id) => id !== user_id), user_id]
+                  : currentUsers.filter((id) => id !== user_id);
+
+                get().setTypingUsers(segment_id, newUsers);
+              }
+              break;
+
+            default:
+              break;
+          }
+        },
+
+        setLastVisitedRoute: (route) => set({ lastVisitedRoute: route }),
+
+        updatePageState: (key, value) =>
+          set((state) => {
+            const previous = state.pageState[key];
+            let nextValue: unknown;
+
+            if (typeof value === 'function') {
+              nextValue = (value as (prev?: unknown) => unknown)(previous);
+            } else if (
+              value &&
+              typeof value === 'object' &&
+              !Array.isArray(value) &&
+              previous &&
+              typeof previous === 'object' &&
+              !Array.isArray(previous)
+            ) {
+              nextValue = { ...previous, ...value };
+            } else {
+              nextValue = value;
+            }
+
+            return {
+              pageState: {
+                ...state.pageState,
+                [key]: nextValue,
+              },
+            };
+          }),
+
+        clearPageState: (key) =>
+          set((state) => {
+            if (!key) {
+              return { pageState: {} };
+            }
+            const newPageState = { ...state.pageState };
+            delete newPageState[key];
+            return { pageState: newPageState };
+          }),
+
+        setProjectDraft: (updates) =>
+          set((state) => {
+            const currentDraft = state.projectDraft;
+            const nextDraft =
+              typeof updates === 'function'
+                ? (updates as (draft: ProjectDraft) => ProjectDraft)(currentDraft)
+                : { ...currentDraft, ...updates };
+            return { projectDraft: nextDraft };
+          }),
+
+        resetProjectDraft: () => set({ projectDraft: defaultProjectDraft }),
+
+        logout: () => {
+          if (typeof window !== 'undefined') {
+            window.localStorage.removeItem('token');
+          }
+          set({
+            user: null,
+            isAuthenticated: false,
+            token: null,
+            projects: [],
+            currentProject: null,
+            segments: [],
+            currentSegment: null,
+            isConnected: false,
+            collaborators: [],
+            typingUsers: {},
+            isLoading: false,
+            error: null,
+            notifications: [],
+            lastVisitedRoute: '/login',
+            pageState: {},
+            projectDraft: defaultProjectDraft,
+          });
+        },
+      }),
+      {
+        name: 'tms-store',
+        storage: createJSONStorage(() =>
+          typeof window !== 'undefined' ? window.localStorage : noopStorage,
+        ),
+        partialize: (state) => ({
+          token: state.token,
+          user: state.user,
+          projects: state.projects,
+          currentProject: state.currentProject,
+          segments: state.segments,
+          currentSegment: state.currentSegment,
+          notifications: state.notifications,
+          isAuthenticated: state.isAuthenticated,
+          lastVisitedRoute: state.lastVisitedRoute,
+          pageState: state.pageState,
+          projectDraft: state.projectDraft,
+        }),
+      },
+    ),
+  ),
 );

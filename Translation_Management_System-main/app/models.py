@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
 
 class ConnectorType(str, Enum):
@@ -214,6 +214,7 @@ class ProjectCreate(BaseModel):
     description: Optional[str] = None
     assigned_vendor_id: Optional[str] = None
     connector_id: Optional[str] = None
+    created_by_id: Optional[str] = None
     metadata: Dict[str, str] = Field(default_factory=dict)
 
 
@@ -378,3 +379,15 @@ class UserResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+    @validator("role", pre=True)
+    def _normalize_role(cls, value):
+        """Ensure database enum values map to API enum."""
+        if isinstance(value, str):
+            return value.lower()
+        # Handle SQLAlchemy Enum instances exposing .value/.name
+        if hasattr(value, "label"):
+            return value.label
+        if hasattr(value, "value"):
+            return value.value.lower()
+        return value

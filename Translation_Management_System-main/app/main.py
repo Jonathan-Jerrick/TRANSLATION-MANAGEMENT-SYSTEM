@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
 from uuid import uuid4
@@ -11,10 +12,10 @@ from fastapi import FastAPI, HTTPException, Query, Depends, WebSocket, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
 import structlog
+from pydantic import BaseModel, Field
 
-from .database import get_db, create_tables
+from .database import engine, get_db, create_tables, SessionLocal
 from .auth import get_current_user, authenticate_user, create_access_token, get_password_hash
 from .llm_service import LLMService
 from .websocket_manager import manager, websocket_handler
@@ -49,8 +50,8 @@ from .services import (
     TranslationMemoryService,
 )
 from .state import state
-from .db_models import User, Project, TranslationSegment as DBSegment
-import json
+from .db_models import User, UserRole as DBUserRole
+from sqlalchemy import text
 
 
 # Configure structured logging
@@ -74,6 +75,22 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
+LANGUAGE_OPTIONS = [
+    {"code": "en-US", "label": "English (United States)"},
+    {"code": "en-GB", "label": "English (United Kingdom)"},
+    {"code": "es-ES", "label": "Spanish (Spain)"},
+    {"code": "fr-FR", "label": "French (France)"},
+    {"code": "de-DE", "label": "German (Germany)"},
+    {"code": "it-IT", "label": "Italian (Italy)"},
+    {"code": "pt-BR", "label": "Portuguese (Brazil)"},
+    {"code": "ja-JP", "label": "Japanese"},
+    {"code": "ko-KR", "label": "Korean"},
+    {"code": "zh-CN", "label": "Chinese (Simplified)"},
+    {"code": "ru-RU", "label": "Russian"},
+    {"code": "pl-PL", "label": "Polish"},
+    {"code": "ar-SA", "label": "Arabic"},
+]
+
 app = FastAPI(
     title="Translation Management System",
     description=(
@@ -93,24 +110,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Mount static files, ensuring the directory exists in ephemeral environments
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # Initialize services
 llm_service = LLMService()
 
 
-tm_service = TranslationMemoryService(state)
-term_service = TermBaseService(state)
+tm_service = TranslationMemoryService(state, SessionLocal)
+term_service = TermBaseService(state, SessionLocal)
 nmt_service = NMTService()
-project_service = ProjectService(state, tm_service, term_service, nmt_service)
+project_service = ProjectService(state, tm_service, term_service, nmt_service, SessionLocal)
 job_service = JobService(state, tm_service, project_service)
 
 # Create database tables
 create_tables()
 
-# Seed initial data
+
+def _normalize_user_roles() -> None:
+    """Ensure legacy rows store enum values using uppercase representation."""
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE users
+                SET role = upper(role::text)::userrole
+                WHERE role IS NOT NULL
+                  AND role <> upper(role::text)::userrole
+                """
+            )
+        )
+
+
+_normalize_user_roles()
+
+project_service.load_from_db()
+tm_service.load_from_db()
+term_service.load_from_db()
+
 seed_initial_data(state, project_service, tm_service, term_service)
+
+
+class LocaleOption(BaseModel):
+    code: str
+    label: str
+
+
+@app.get("/locales", response_model=List[LocaleOption], summary="List supported locales")
+def list_locales() -> List[LocaleOption]:
+    return [LocaleOption(**locale) for locale in LANGUAGE_OPTIONS]
+
+
+class ClientLogEntry(BaseModel):
+    """Minimal payload for capturing frontend runtime errors."""
+
+    type: str = Field(..., description="Event category (error, unhandledrejection, etc.)")
+    message: Optional[str] = None
+    source: Optional[str] = None
+    line: Optional[int] = None
+    column: Optional[int] = None
+    reason: Optional[dict] = None
+    userAgent: Optional[str] = None
+    href: Optional[str] = None
+    timestamp: Optional[str] = None
 
 
 # Authentication endpoints
@@ -124,12 +190,13 @@ def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     
     # Create new user
     hashed_password = get_password_hash(user_data.password)
+    db_role = DBUserRole[user_data.role.name]
     user = User(
         email=user_data.email,
         username=user_data.username,
         hashed_password=hashed_password,
         full_name=user_data.full_name,
-        role=user_data.role
+        role=db_role
     )
     db.add(user)
     db.commit()
@@ -175,6 +242,23 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     except WebSocketDisconnect:
         manager.disconnect(user_id)
         logger.info("WebSocket disconnected", user_id=user_id)
+
+
+@app.post("/client-log", summary="Capture frontend runtime errors")
+async def ingest_client_log(entry: ClientLogEntry):
+    """Store client-side runtime errors for easier debugging."""
+    logger.warning(
+        "Client log entry received",
+        event_type=entry.type,
+        message=entry.message,
+        source=entry.source,
+        line=entry.line,
+        column=entry.column,
+        reason=entry.reason,
+        user_agent=entry.userAgent,
+        href=entry.href,
+    )
+    return {"status": "ok"}
 
 
 # File upload endpoints
@@ -357,23 +441,60 @@ def sync_content(connector_id: str, payload: ContentSyncRequest) -> Job:
 
 
 @app.get("/jobs", response_model=List[Job], summary="List translation jobs")
-def list_jobs() -> List[Job]:
+def list_jobs(current_user: User = Depends(get_current_user)) -> List[Job]:
     return state.list_jobs()
 
 
-@app.get("/projects", response_model=List[Job], summary="List projects")
-def list_projects() -> List[Job]:
-    return project_service.list_projects()
+@app.get("/projects", response_model=List[Job], summary="List projects for the current user")
+def list_projects(current_user: User = Depends(get_current_user)) -> List[Job]:
+    return project_service.list_projects_for_user(current_user)
 
 
 @app.post("/projects", response_model=Job, summary="Create a project manually")
-def create_project(payload: ProjectCreate) -> Job:
-    job = project_service.create_project(payload)
+def create_project(payload: ProjectCreate, current_user: User = Depends(get_current_user)) -> Job:
+    role = getattr(current_user.role, "label", str(current_user.role).lower())
+    if role not in {"manager", "admin"}:
+        raise HTTPException(status_code=403, detail="Only managers can create projects.")
+
+    payload_dict = payload.dict()
+    metadata = dict(payload_dict.get("metadata") or {})
+    metadata.setdefault("manager_email", current_user.email)
+    metadata.setdefault("manager_name", current_user.full_name or current_user.username)
+    payload_dict["metadata"] = metadata
+    payload_dict["created_by_id"] = str(current_user.id)
+    enriched_payload = ProjectCreate(**payload_dict)
+    job = project_service.create_project(enriched_payload)
     return job
 
 
+@app.get("/projects/{project_id}", response_model=Job, summary="Get project details")
+def get_project_detail(project_id: str, current_user: User = Depends(get_current_user)) -> Job:
+    try:
+        return project_service.get_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.get(
+    "/projects/{project_id}/segments",
+    response_model=List[TranslationSegment],
+    summary="List segments for a project",
+)
+def list_project_segments(project_id: str, current_user: User = Depends(get_current_user)) -> List[TranslationSegment]:
+    try:
+        project = project_service.get_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    return project.segments
+
+
 @app.post("/projects/{project_id}/segments/{segment_id}", response_model=TranslationSegment)
-def update_segment(project_id: str, segment_id: str, payload: SegmentUpdate) -> TranslationSegment:
+def update_segment(
+    project_id: str,
+    segment_id: str,
+    payload: SegmentUpdate,
+    current_user: User = Depends(get_current_user),
+) -> TranslationSegment:
     try:
         return project_service.update_segment(project_id, segment_id, payload)
     except KeyError as exc:  # pragma: no cover

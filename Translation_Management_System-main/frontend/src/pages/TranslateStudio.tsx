@@ -1,59 +1,106 @@
-import React, { useState, useEffect } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiService } from '../services/api';
-import { useStore } from '../store/useStore';
-import { wsService } from '../services/websocket';
+import React, { useEffect, useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-hot-toast';
-import { 
-  Save, 
-  RefreshCw, 
-  CheckCircle, 
+import {
+  RefreshCw,
+  CheckCircle,
   AlertTriangle,
   Users,
   MessageSquare,
   Zap,
-  Target
+  Target,
 } from 'lucide-react';
+import { apiService } from '../services/api';
+import { useStore, TranslationSegment as SegmentType } from '../store/useStore';
+import { wsService } from '../services/websocket';
+import { usePageState } from '../hooks/usePageState';
 
-interface TranslationSegment {
-  id: string;
-  source_text: string;
-  target_locale: string;
-  tm_suggestion?: string;
-  tm_score?: number;
-  nmt_suggestion?: string;
-  post_edit?: string;
-  reviewer_notes?: string;
-  risk_level?: 'low' | 'medium' | 'high';
-  quality_estimate?: number;
-  qa_flags: string[];
-  term_hits: string[];
-  created_at: string;
-  updated_at?: string;
-}
+const DEFAULT_STUDIO_STATE = {
+  targetLocale: 'en',
+  selectedSegmentId: null as string | null,
+};
 
 const TranslateStudio: React.FC = () => {
   const { currentProject, collaborators, typingUsers } = useStore();
-  const [selectedSegment, setSelectedSegment] = useState<TranslationSegment | null>(null);
-  const [targetLocale, setTargetLocale] = useState('en');
+  const setCurrentSegmentStore = useStore((state) => state.setCurrentSegment);
+  const [studioState, setStudioState] = usePageState('studio:view', DEFAULT_STUDIO_STATE);
+  const { targetLocale, selectedSegmentId } = studioState;
   const [isTranslating, setIsTranslating] = useState(false);
   const [isEstimatingQuality, setIsEstimatingQuality] = useState(false);
   const queryClient = useQueryClient();
 
-  const { data: segments, isLoading } = useQuery({
-    queryKey: ['project-segments', currentProject?.id, targetLocale],
+  const activeTargetLocale = useMemo(() => {
+    if (!currentProject) {
+      return targetLocale;
+    }
+    const availableTargets = currentProject.target_locales;
+    if (availableTargets && availableTargets.length > 0) {
+      return availableTargets.includes(targetLocale)
+        ? targetLocale
+        : availableTargets[0];
+    }
+    return currentProject.source_locale || targetLocale;
+  }, [currentProject, targetLocale]);
+
+  useEffect(() => {
+    if (!currentProject) {
+      setStudioState({ targetLocale: 'en', selectedSegmentId: null });
+      return;
+    }
+    if (activeTargetLocale !== targetLocale) {
+      setStudioState({ targetLocale: activeTargetLocale });
+    }
+  }, [activeTargetLocale, currentProject, setStudioState, targetLocale]);
+
+  const { data: segments = [], isLoading } = useQuery<SegmentType[]>({
+    queryKey: ['project-segments', currentProject?.id, activeTargetLocale],
     queryFn: () => apiService.getProjectSegments(currentProject?.id || ''),
     enabled: !!currentProject?.id,
   });
 
   const { data: studioData } = useQuery({
-    queryKey: ['studio-snapshot', currentProject?.id, targetLocale],
-    queryFn: () => apiService.getStudioSnapshot(currentProject?.id || '', targetLocale),
+    queryKey: ['studio-snapshot', currentProject?.id, activeTargetLocale],
+    queryFn: () => apiService.getStudioSnapshot(currentProject?.id || '', activeTargetLocale),
     enabled: !!currentProject?.id,
   });
 
+  const selectedSegment = useMemo(() => {
+    if (!segments || !selectedSegmentId) {
+      return null;
+    }
+    return segments.find((segment) => segment.id === selectedSegmentId) || null;
+  }, [segments, selectedSegmentId]);
+
+  useEffect(() => {
+    if (!currentProject?.id) {
+      return;
+    }
+    wsService.joinProject(currentProject.id);
+    return () => {
+      wsService.leaveProject(currentProject.id);
+    };
+  }, [currentProject?.id]);
+
+  useEffect(() => {
+    if (!segments || segments.length === 0) {
+      if (selectedSegmentId) {
+        setStudioState({ selectedSegmentId: null });
+      }
+      setCurrentSegmentStore(null);
+      return;
+    }
+
+    const existing = segments.find((segment) => segment.id === selectedSegmentId);
+    if (!existing) {
+      setStudioState({ selectedSegmentId: segments[0].id });
+      setCurrentSegmentStore(segments[0]);
+    } else {
+      setCurrentSegmentStore(existing);
+    }
+  }, [segments, selectedSegmentId, setCurrentSegmentStore, setStudioState]);
+
   const updateSegmentMutation = useMutation({
-    mutationFn: ({ segmentId, updates }: { segmentId: string; updates: any }) =>
+    mutationFn: ({ segmentId, updates }: { segmentId: string; updates: Partial<SegmentType> }) =>
       apiService.updateSegment(currentProject?.id || '', segmentId, updates),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project-segments'] });
@@ -70,7 +117,7 @@ const TranslateStudio: React.FC = () => {
       if (selectedSegment) {
         updateSegmentMutation.mutate({
           segmentId: selectedSegment.id,
-          updates: { nmt_suggestion: result.translation }
+          updates: { nmt_suggestion: result.translation },
         });
       }
       setIsTranslating(false);
@@ -88,10 +135,10 @@ const TranslateStudio: React.FC = () => {
       if (selectedSegment) {
         updateSegmentMutation.mutate({
           segmentId: selectedSegment.id,
-          updates: { 
+          updates: {
             quality_estimate: result.quality_score,
-            risk_level: result.risk_level
-          }
+            risk_level: result.risk_level,
+          },
         });
       }
       setIsEstimatingQuality(false);
@@ -103,67 +150,62 @@ const TranslateStudio: React.FC = () => {
     },
   });
 
-  useEffect(() => {
-    if (currentProject?.id) {
-      wsService.joinProject(currentProject.id);
-    }
-    return () => {
-      if (currentProject?.id) {
-        wsService.leaveProject(currentProject.id);
-      }
-    };
-  }, [currentProject?.id]);
-
-  const handleSegmentSelect = (segment: TranslationSegment) => {
-    setSelectedSegment(segment);
+  const handleSegmentSelect = (segment: SegmentType) => {
+    setStudioState({ selectedSegmentId: segment.id });
+    setCurrentSegmentStore(segment);
   };
 
-  const handleTranslation = async () => {
+  const handleTranslation = () => {
     if (!selectedSegment) return;
-    
+
     setIsTranslating(true);
     translateMutation.mutate({
       source_text: selectedSegment.source_text,
       source_lang: 'auto',
-      target_lang: targetLocale,
-      provider: 'openai'
+      target_lang: activeTargetLocale,
+      provider: 'openai',
     });
   };
 
-  const handleQualityEstimate = async () => {
+  const handleQualityEstimate = () => {
     if (!selectedSegment || !selectedSegment.post_edit) return;
-    
+
     setIsEstimatingQuality(true);
     qualityEstimateMutation.mutate({
       source_text: selectedSegment.source_text,
       translated_text: selectedSegment.post_edit,
       source_lang: 'auto',
-      target_lang: targetLocale
+      target_lang: activeTargetLocale,
     });
   };
 
-  const handleSegmentUpdate = (updates: Partial<TranslationSegment>) => {
+  const handleSegmentUpdate = (updates: Partial<SegmentType>) => {
     if (!selectedSegment) return;
-    
+
     updateSegmentMutation.mutate({
       segmentId: selectedSegment.id,
-      updates
+      updates,
     });
-    
-    // Send real-time update
-    wsService.updateSegment(
-      currentProject?.id || '', 
-      selectedSegment.id, 
-      updates.post_edit || ''
-    );
+
+    if (updates.post_edit !== undefined) {
+      wsService.updateSegment(
+        currentProject?.id || '',
+        selectedSegment.id,
+        updates.post_edit || '',
+      );
+    }
   };
 
   const getRiskColor = (risk?: string) => {
     switch (risk) {
-      case 'high': return 'text-red-600';
-      case 'medium': return 'text-yellow-600';
-      case 'low': return 'text-green-600';
-      default: return 'text-gray-600';
+      case 'high':
+        return 'text-red-600';
+      case 'medium':
+        return 'text-yellow-600';
+      case 'low':
+        return 'text-green-600';
+      default:
+        return 'text-gray-600';
     }
   };
 
@@ -181,9 +223,7 @@ const TranslateStudio: React.FC = () => {
           <Target className="h-12 w-12 mx-auto" />
         </div>
         <h3 className="text-lg font-medium text-gray-900 mb-2">No project selected</h3>
-        <p className="text-gray-600">
-          Please select a project to start translating.
-        </p>
+        <p className="text-gray-600">Please select a project to start translating.</p>
       </div>
     );
   }
@@ -196,14 +236,18 @@ const TranslateStudio: React.FC = () => {
     );
   }
 
+  const availableTargetLocales =
+    currentProject.target_locales && currentProject.target_locales.length > 0
+      ? currentProject.target_locales
+      : [currentProject.source_locale];
+
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Translation Studio</h1>
           <p className="text-gray-600 mt-1">
-            {currentProject.name} • {currentProject.source_locale} → {targetLocale}
+            {currentProject.name} • {currentProject.source_locale} → {activeTargetLocale}
           </p>
         </div>
         <div className="flex items-center space-x-4">
@@ -212,46 +256,47 @@ const TranslateStudio: React.FC = () => {
             <span>{collaborators.length} online</span>
           </div>
           <select
-            value={targetLocale}
-            onChange={(e) => setTargetLocale(e.target.value)}
+            value={activeTargetLocale}
+            onChange={(event) => setStudioState({ targetLocale: event.target.value })}
             className="form-select"
           >
-            {currentProject.target_locales.map(locale => (
-              <option key={locale} value={locale}>{locale.toUpperCase()}</option>
+            {availableTargetLocales.map((locale) => (
+              <option key={locale} value={locale}>
+                {locale.toUpperCase()}
+              </option>
             ))}
           </select>
         </div>
       </div>
 
       <div className="translation-studio">
-        {/* Segments List */}
         <div className="segment-editor">
           <h3 className="text-lg font-semibold text-gray-900 mb-4">Segments</h3>
           <div className="space-y-3 max-h-96 overflow-y-auto">
-            {segments?.map((segment: TranslationSegment) => (
+            {segments.map((segment) => (
               <div
                 key={segment.id}
                 onClick={() => handleSegmentSelect(segment)}
                 className={`segment cursor-pointer transition-colors ${
-                  selectedSegment?.id === segment.id 
-                    ? 'ring-2 ring-primary-500 bg-primary-50' 
+                  selectedSegment?.id === segment.id
+                    ? 'ring-2 ring-primary-500 bg-primary-50'
                     : 'hover:bg-gray-50'
                 }`}
               >
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
-                    <p className="text-sm text-gray-900 mb-2">
-                      {segment.source_text}
-                    </p>
+                    <p className="text-sm text-gray-900 mb-2">{segment.source_text}</p>
                     {segment.post_edit && (
-                      <p className="text-sm text-gray-600 italic">
-                        {segment.post_edit}
-                      </p>
+                      <p className="text-sm text-gray-600 italic">{segment.post_edit}</p>
                     )}
                   </div>
                   <div className="flex items-center space-x-2 ml-4">
                     {segment.quality_estimate && (
-                      <span className={`text-xs font-medium ${getQualityColor(segment.quality_estimate)}`}>
+                      <span
+                        className={`text-xs font-medium ${getQualityColor(
+                          segment.quality_estimate,
+                        )}`}
+                      >
                         {Math.round(segment.quality_estimate)}%
                       </span>
                     )}
@@ -265,7 +310,7 @@ const TranslateStudio: React.FC = () => {
                     )}
                   </div>
                 </div>
-                
+
                 {typingUsers[segment.id] && typingUsers[segment.id].length > 0 && (
                   <div className="typing-indicator">
                     {typingUsers[segment.id].join(', ')} typing...
@@ -276,7 +321,6 @@ const TranslateStudio: React.FC = () => {
           </div>
         </div>
 
-        {/* Translation Editor */}
         <div className="segment-editor">
           {selectedSegment ? (
             <>
@@ -311,7 +355,6 @@ const TranslateStudio: React.FC = () => {
               </div>
 
               <div className="space-y-4">
-                {/* Source Text */}
                 <div>
                   <label className="form-label">Source Text</label>
                   <div className="segment-source p-3 rounded-lg">
@@ -319,7 +362,6 @@ const TranslateStudio: React.FC = () => {
                   </div>
                 </div>
 
-                {/* TM Suggestion */}
                 {selectedSegment.tm_suggestion && (
                   <div>
                     <label className="form-label">Translation Memory Match</label>
@@ -332,7 +374,6 @@ const TranslateStudio: React.FC = () => {
                   </div>
                 )}
 
-                {/* NMT Suggestion */}
                 {selectedSegment.nmt_suggestion && (
                   <div>
                     <label className="form-label">AI Translation</label>
@@ -342,39 +383,33 @@ const TranslateStudio: React.FC = () => {
                   </div>
                 )}
 
-                {/* Translation Editor */}
                 <div>
                   <label className="form-label">Your Translation</label>
                   <textarea
                     value={selectedSegment.post_edit || ''}
-                    onChange={(e) => handleSegmentUpdate({ post_edit: e.target.value })}
+                    onChange={(event) => handleSegmentUpdate({ post_edit: event.target.value })}
                     className="segment-textarea"
                     rows={4}
                     placeholder="Enter your translation here..."
                     onFocus={() => {
-                      wsService.sendTyping(
-                        currentProject.id, 
-                        selectedSegment.id, 
-                        true
-                      );
+                      wsService.sendTyping(currentProject.id, selectedSegment.id, true);
                     }}
                     onBlur={() => {
-                      wsService.sendTyping(
-                        currentProject.id, 
-                        selectedSegment.id, 
-                        false
-                      );
+                      wsService.sendTyping(currentProject.id, selectedSegment.id, false);
                     }}
                   />
                 </div>
 
-                {/* Quality Metrics */}
                 {(selectedSegment.quality_estimate || selectedSegment.risk_level) && (
                   <div className="grid grid-cols-2 gap-4">
                     {selectedSegment.quality_estimate && (
                       <div>
                         <label className="form-label">Quality Score</label>
-                        <div className={`text-2xl font-bold ${getQualityColor(selectedSegment.quality_estimate)}`}>
+                        <div
+                          className={`text-2xl font-bold ${getQualityColor(
+                            selectedSegment.quality_estimate,
+                          )}`}
+                        >
                           {Math.round(selectedSegment.quality_estimate)}%
                         </div>
                       </div>
@@ -382,7 +417,11 @@ const TranslateStudio: React.FC = () => {
                     {selectedSegment.risk_level && (
                       <div>
                         <label className="form-label">Risk Level</label>
-                        <div className={`text-lg font-semibold ${getRiskColor(selectedSegment.risk_level)}`}>
+                        <div
+                          className={`text-lg font-semibold ${getRiskColor(
+                            selectedSegment.risk_level,
+                          )}`}
+                        >
                           {selectedSegment.risk_level.toUpperCase()}
                         </div>
                       </div>
@@ -390,7 +429,6 @@ const TranslateStudio: React.FC = () => {
                   </div>
                 )}
 
-                {/* QA Flags */}
                 {selectedSegment.qa_flags.length > 0 && (
                   <div>
                     <label className="form-label">Quality Issues</label>
@@ -405,7 +443,6 @@ const TranslateStudio: React.FC = () => {
                   </div>
                 )}
 
-                {/* Term Hits */}
                 {selectedSegment.term_hits.length > 0 && (
                   <div>
                     <label className="form-label">Terminology Matches</label>
@@ -419,12 +456,13 @@ const TranslateStudio: React.FC = () => {
                   </div>
                 )}
 
-                {/* Reviewer Notes */}
                 <div>
                   <label className="form-label">Reviewer Notes</label>
                   <textarea
                     value={selectedSegment.reviewer_notes || ''}
-                    onChange={(e) => handleSegmentUpdate({ reviewer_notes: e.target.value })}
+                    onChange={(event) =>
+                      handleSegmentUpdate({ reviewer_notes: event.target.value })
+                    }
                     className="form-textarea"
                     rows={2}
                     placeholder="Add notes for reviewers..."
@@ -438,15 +476,12 @@ const TranslateStudio: React.FC = () => {
                 <MessageSquare className="h-12 w-12 mx-auto" />
               </div>
               <h3 className="text-lg font-medium text-gray-900 mb-2">Select a segment</h3>
-              <p className="text-gray-600">
-                Choose a segment from the list to start translating.
-              </p>
+              <p className="text-gray-600">Choose a segment from the list to start translating.</p>
             </div>
           )}
         </div>
       </div>
 
-      {/* Translation Memory & Terms Sidebar */}
       {studioData && (
         <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="activity-feed">
@@ -456,9 +491,7 @@ const TranslateStudio: React.FC = () => {
                 <div key={entry.id} className="p-3 bg-blue-50 rounded-lg">
                   <p className="text-sm font-medium text-gray-900">{entry.source_text}</p>
                   <p className="text-sm text-gray-600 mt-1">{entry.translated_text}</p>
-                  <p className="text-xs text-gray-500 mt-1">
-                    Usage: {entry.usage_count} times
-                  </p>
+                  <p className="text-xs text-gray-500 mt-1">Usage: {entry.usage_count} times</p>
                 </div>
               ))}
             </div>
@@ -471,9 +504,7 @@ const TranslateStudio: React.FC = () => {
                 <div key={term.id} className="p-3 bg-green-50 rounded-lg">
                   <p className="text-sm font-medium text-gray-900">{term.term}</p>
                   <p className="text-sm text-gray-600 mt-1">{term.translation}</p>
-                  {term.notes && (
-                    <p className="text-xs text-gray-500 mt-1">{term.notes}</p>
-                  )}
+                  {term.notes && <p className="text-xs text-gray-500 mt-1">{term.notes}</p>}
                 </div>
               ))}
             </div>
